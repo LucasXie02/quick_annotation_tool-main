@@ -5,11 +5,17 @@ import './App.css';
 import CanvasStage from './components/CanvasStage';
 import ToolPanel from './components/ToolPanel';
 import ImageLoader from './components/ImageLoader';
-import GroupPanel from './components/GroupPanel';
 import ImportExportPanel from './components/ImportExportPanel';
 import ClassPanel from './components/ClassPanel';
+import InstructionsPanel from './components/InstructionsPanel';
 import DatasetPanel from './components/DatasetPanel';
-import { translatePoints, isShapeWithinRect, normalizeRectPoints, clonePoints } from './utils/geometry';
+import {
+  translatePoints,
+  isShapeWithinRect,
+  normalizeRectPoints,
+  clonePoints,
+  rotatedBoxToPolygon
+} from './utils/geometry';
 import { consumeLabelmeAnnotation } from './utils/labelme';
 import type {
   AnnotationGroup,
@@ -55,7 +61,14 @@ const loadImageElement = (src: string) =>
 
 const cloneShape = (shape: AnnotationShape): AnnotationShape => ({
   ...shape,
-  points: clonePoints(shape.points)
+  points: clonePoints(shape.points),
+  metadata: shape.metadata
+    ? {
+        rotatedBox: shape.metadata.rotatedBox
+          ? { ...shape.metadata.rotatedBox, center: [...shape.metadata.rotatedBox.center] as Point }
+          : null
+      }
+    : undefined
 });
 
 const uniqueMerge = (existing: string[], incoming: string[]) => {
@@ -86,6 +99,9 @@ function App() {
   const [history, setHistory] = useState<AnnotationShape[][]>([]);
   const [classes, setClasses] = useState<string[]>(['object']);
   const [activeClass, setActiveClass] = useState('object');
+  const [instructionsLang, setInstructionsLang] = useState<'en' | 'zh'>('en');
+  const [pendingUngroupGroupId, setPendingUngroupGroupId] = useState<number | null>(null);
+  const [selectionLocked, setSelectionLocked] = useState(false);
 
   const captureHistory = useCallback((currentShapes: AnnotationShape[]) => {
     if (currentShapes.length === 0) {
@@ -114,6 +130,7 @@ function App() {
         setImage({ name: item.name, width: img.width, height: img.height, src: dataUrl });
         setActiveDatasetId(item.id);
         setClipboard(null);
+        setPendingUngroupGroupId(null);
         if (item.annotationFile) {
           const text = await item.annotationFile.text();
           const parsed = JSON.parse(text) as LabelmeAnnotation;
@@ -155,6 +172,7 @@ function App() {
     setHistory([]);
     setViewResetTrigger((prev) => prev + 1);
     syncClassesWithLabels([]);
+    setPendingUngroupGroupId(null);
   };
 
   const handleDatasetFolderSelected = useCallback(
@@ -235,7 +253,15 @@ function App() {
   }, [nextGroupId]);
 
   const handleCreateShape = useCallback(
-    ({ shapeType, points }: { shapeType: ShapeType; points: Point[] }) => {
+    ({
+      shapeType,
+      points,
+      metadata
+    }: {
+      shapeType: ShapeType;
+      points: Point[];
+      metadata?: AnnotationShape['metadata'];
+    }) => {
       const groupId = ensureActiveGroup();
       const newShape: AnnotationShape = {
         id: nanoid(),
@@ -243,7 +269,8 @@ function App() {
         groupId,
         shapeType,
         points,
-        flags: {}
+        flags: {},
+        metadata
       };
       setShapes((prev) => {
         captureHistory(prev);
@@ -255,7 +282,14 @@ function App() {
   );
 
   const handleBatchUpdateShapes = useCallback(
-    (updates: Array<{ shapeId: string; points: Point[]; shapeType?: ShapeType }>) => {
+    (
+      updates: Array<{
+        shapeId: string;
+        points: Point[];
+        shapeType?: ShapeType;
+        metadata?: AnnotationShape['metadata'];
+      }>
+    ) => {
       const updateMap = new Map(updates.map((item) => [item.shapeId, item]));
       if (updates.length === 0) return;
       setShapes((prev) => {
@@ -266,7 +300,8 @@ function App() {
           return {
             ...shape,
             points: update.points,
-            shapeType: update.shapeType ?? shape.shapeType
+            shapeType: update.shapeType ?? shape.shapeType,
+            metadata: update.metadata ?? shape.metadata
           };
         });
       });
@@ -274,15 +309,19 @@ function App() {
     [captureHistory]
   );
 
-  const handleUpdateShapePoints = useCallback((shapeId: string, points: Point[]) => {
-    handleBatchUpdateShapes([{ shapeId, points }]);
-  }, [handleBatchUpdateShapes]);
+  const handleUpdateShapePoints = useCallback(
+    (shapeId: string, points: Point[], metadata?: AnnotationShape['metadata']) => {
+      handleBatchUpdateShapes([{ shapeId, points, metadata }]);
+    },
+    [handleBatchUpdateShapes]
+  );
 
   const handleSelectShape = useCallback(
     (shapeId: string | null, groupId?: number) => {
       setSelectedShapeId(shapeId);
       if (shapeId === null) {
         setActiveGroupId(null);
+        setSelectionLocked(false);
       } else if (groupId !== undefined) {
         setActiveGroupId(groupId);
       }
@@ -351,10 +390,7 @@ function App() {
     if (activeGroupId === null) return;
     const groupShapes = shapes.filter((shape) => shape.groupId === activeGroupId);
     if (groupShapes.length === 0) return;
-    const clones = groupShapes.map((shape) => ({
-      ...shape,
-      points: shape.points.map((pt) => [pt[0], pt[1]]) as Point[]
-    }));
+    const clones = groupShapes.map((shape) => cloneShape(shape));
     setClipboard(clones);
   };
 
@@ -365,10 +401,21 @@ function App() {
     const label = sourceGroup ? `${sourceGroup.label} Copy` : `Object ${newGroupId}`;
     const offset = 20;
     const pastedShapes = clipboard.map((shape) => ({
-      ...shape,
+      ...cloneShape(shape),
       id: nanoid(),
       groupId: newGroupId,
-      points: translatePoints(shape.points, offset, offset)
+      points: translatePoints(shape.points, offset, offset),
+      metadata: shape.metadata?.rotatedBox
+        ? {
+            rotatedBox: {
+              ...shape.metadata.rotatedBox,
+              center: [
+                shape.metadata.rotatedBox.center[0] + offset,
+                shape.metadata.rotatedBox.center[1] + offset
+              ] as Point
+            }
+          }
+        : shape.metadata
     }));
     setGroups((prev) => [...prev, { id: newGroupId, label }]);
     setShapes((prev) => {
@@ -391,10 +438,9 @@ function App() {
       const newGroupId = nextGroupId;
       const label = `Region ${newGroupId}`;
       const clones = selectedShapes.map((shape) => ({
-        ...shape,
+        ...cloneShape(shape),
         id: nanoid(),
-        groupId: newGroupId,
-        points: clonePoints(shape.points)
+        groupId: newGroupId
       }));
       setGroups((prev) => [...prev, { id: newGroupId, label }]);
       setShapes((prev) => {
@@ -405,9 +451,49 @@ function App() {
       setActiveGroupId(newGroupId);
       setSelectedShapeId(clones[0]?.id ?? null);
       setTool('select');
+      setPendingUngroupGroupId(newGroupId);
     },
     [nextGroupId, shapes, captureHistory]
   );
+
+  const handleUngroupGroup = (groupId: number) => {
+    const targetShapes = shapes.filter((shape) => shape.groupId === groupId);
+    if (targetShapes.length <= 1) return;
+    let next = nextGroupId;
+    const idMap = new Map<string, number>();
+    targetShapes.forEach((shape) => {
+      idMap.set(shape.id, next);
+      next += 1;
+    });
+    captureHistory(shapes);
+    setShapes((prev) =>
+      prev.map((shape) =>
+        idMap.has(shape.id) ? { ...shape, groupId: idMap.get(shape.id)! } : shape
+      )
+    );
+    setGroups((prev) => {
+      const filtered = prev.filter((group) => group.id !== groupId);
+      const additions = targetShapes.map((shape) => ({
+        id: idMap.get(shape.id)!,
+        label: shape.label || `Object ${idMap.get(shape.id)!}`
+      }));
+      return [...filtered, ...additions];
+    });
+    setNextGroupId(next);
+    setActiveGroupId(null);
+    setSelectedShapeId(targetShapes[0]?.id ?? null);
+    setPendingUngroupGroupId((prev) => (prev === groupId ? null : prev));
+  };
+
+  const handleGroupTransformComplete = (groupId: number, mode: 'translate' | 'rotate') => {
+    if (mode === 'translate' && pendingUngroupGroupId === groupId) {
+      // keep the group active so users can pan/zoom before ungrouping
+      setActiveGroupId(groupId);
+    }
+    if (mode === 'translate') {
+      setPendingUngroupGroupId(groupId);
+    }
+  };
 
   const handleAddClass = (label: string) => {
     const trimmed = label.trim();
@@ -422,6 +508,30 @@ function App() {
     }
   };
 
+  const handleAdjustRotatedBox = (
+    shapeId: string,
+    updates: Partial<{ width: number; height: number; angle: number }>
+  ) => {
+    setShapes((prev) => {
+      captureHistory(prev);
+      return prev.map((shape) => {
+        if (shape.id !== shapeId || !shape.metadata?.rotatedBox) return shape;
+        const nextMeta = {
+          ...shape.metadata.rotatedBox,
+          ...updates,
+          width: Math.max(4, updates.width ?? shape.metadata.rotatedBox.width),
+          height: Math.max(4, updates.height ?? shape.metadata.rotatedBox.height),
+          angle: updates.angle ?? shape.metadata.rotatedBox.angle
+        };
+        return {
+          ...shape,
+          metadata: { rotatedBox: nextMeta },
+          points: rotatedBoxToPolygon(nextMeta)
+        };
+      });
+    });
+  };
+
   const selectionMeta = useMemo(() => {
     if (!selectedShapeId) return null;
     const shape = shapes.find((s) => s.id === selectedShapeId);
@@ -432,17 +542,23 @@ function App() {
 
   const canCopyGroup = activeGroupId !== null && shapes.some((shape) => shape.groupId === activeGroupId);
   const canUndo = history.length > 0;
+  const canUngroupSelection =
+    selectionMeta && shapes.filter((shape) => shape.groupId === selectionMeta.shape.groupId).length > 1;
 
   const handleSelectionLabelChange = useCallback(
     (label: string) => {
       const trimmed = label.trim();
       if (!selectionMeta || !trimmed) return;
       syncClassesWithLabels([trimmed]);
-      setShapes((prev) =>
-        prev.map((shape) => (shape.id === selectionMeta.shape.id ? { ...shape, label: trimmed } : shape))
-      );
+      setActiveClass(trimmed);
+      setShapes((prev) => {
+        captureHistory(prev);
+        return prev.map((shape) =>
+          shape.id === selectionMeta.shape.id ? { ...shape, label: trimmed } : shape
+        );
+      });
     },
-    [selectionMeta, syncClassesWithLabels]
+    [selectionMeta, syncClassesWithLabels, captureHistory]
   );
   const canPasteGroup = Boolean(clipboard);
 
@@ -468,6 +584,8 @@ function App() {
               onSelectShape={handleSelectShape}
               onAreaSelect={handleAreaClone}
               viewResetTrigger={viewResetTrigger}
+              onGroupTransformComplete={handleGroupTransformComplete}
+              selectionLocked={selectionLocked}
             />
           ) : (
             <div className="canvas-placeholder">
@@ -477,33 +595,13 @@ function App() {
         </section>
 
         <aside className="control-panel">
+          <InstructionsPanel language={instructionsLang} onLanguageChange={setInstructionsLang} />
           <ImageLoader image={image} onImageLoaded={handleImageLoaded} />
-          <ClassPanel
-            classes={classes}
-            activeClass={activeClass}
-            onSelectClass={handleSelectClass}
-            onAddClass={handleAddClass}
-          />
           <DatasetPanel
             items={datasetItems}
             activeId={activeDatasetId}
             onFolderSelected={handleDatasetFolderSelected}
             onSelectItem={handleSelectDatasetItem}
-          />
-          <ToolPanel
-            activeTool={tool}
-            onChange={setTool}
-            hasSelection={Boolean(selectionMeta)}
-            onDeleteSelected={() => {
-              if (!selectionMeta) return;
-              const groupId = selectionMeta.shape.groupId;
-              const groupShapes = shapes.filter((shape) => shape.groupId === groupId);
-              if (groupShapes.length > 1) {
-                handleDeleteGroup(groupId);
-              } else {
-                handleDeleteShape(selectionMeta.shape.id);
-              }
-            }}
           />
           <div className="control-card">
             <h3>View</h3>
@@ -519,18 +617,26 @@ function App() {
               Undo Last Change
             </button>
           </div>
-          <GroupPanel
-            groups={groups}
-            activeGroupId={activeGroupId}
-            shapes={shapes}
-            onSelectGroup={handleSelectGroup}
-            onCreateGroup={handleCreateGroup}
-            onRenameGroup={handleRenameGroup}
-            onDeleteGroup={handleDeleteGroup}
-            onCopyGroup={handleCopyGroup}
-            onPasteGroup={handlePasteGroup}
-            canCopy={canCopyGroup}
-            canPaste={canPasteGroup}
+          <ToolPanel
+            activeTool={tool}
+            onChange={setTool}
+            hasSelection={Boolean(selectionMeta)}
+            onDeleteSelected={() => {
+              if (!selectionMeta) return;
+              const groupId = selectionMeta.shape.groupId;
+              const groupShapes = shapes.filter((shape) => shape.groupId === groupId);
+              if (groupShapes.length > 1) {
+                handleDeleteGroup(groupId);
+              } else {
+                handleDeleteShape(selectionMeta.shape.id);
+              }
+            }}
+          />
+          <ClassPanel
+            classes={classes}
+            activeClass={activeClass}
+            onSelectClass={handleSelectClass}
+            onAddClass={handleAddClass}
           />
           <ImportExportPanel
             imageName={image?.name ?? null}
@@ -583,6 +689,54 @@ function App() {
                 onClick={() => handleDeleteShape(selectionMeta.shape.id)}
               >
                 Delete Selected Shape
+              </button>
+            )}
+            {selectionMeta?.shape.metadata?.rotatedBox && (
+              <div className="size-controls">
+                <label>
+                  Width
+                  <input
+                    type="number"
+                    min={4}
+                    value={Math.round(selectionMeta.shape.metadata.rotatedBox.width)}
+                    onChange={(event) =>
+                      handleAdjustRotatedBox(selectionMeta.shape.id, {
+                        width: Number(event.target.value)
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  Height
+                  <input
+                    type="number"
+                    min={4}
+                    value={Math.round(selectionMeta.shape.metadata.rotatedBox.height)}
+                    onChange={(event) =>
+                      handleAdjustRotatedBox(selectionMeta.shape.id, {
+                        height: Number(event.target.value)
+                      })
+                    }
+                  />
+                </label>
+              </div>
+            )}
+            {selectionMeta && canUngroupSelection && (
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={() => handleUngroupGroup(selectionMeta.shape.groupId)}
+              >
+                Ungroup Clone
+              </button>
+            )}
+            {selectionMeta && (
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={() => setSelectionLocked((prev) => !prev)}
+              >
+                {selectionLocked ? 'Unlock Selection' : 'Lock Selection'}
               </button>
             )}
           </div>

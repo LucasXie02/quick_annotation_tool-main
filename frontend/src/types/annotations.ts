@@ -2,6 +2,13 @@ export type Point = [number, number];
 
 export type ShapeType = 'rectangle' | 'polygon';
 
+export interface RotatedBoxMeta {
+  center: Point;
+  width: number;
+  height: number;
+  angle: number; // degrees clockwise
+}
+
 export interface AnnotationShape {
   id: string;
   label: string;
@@ -9,6 +16,9 @@ export interface AnnotationShape {
   shapeType: ShapeType;
   points: Point[];
   flags: Record<string, unknown>;
+  metadata?: {
+    rotatedBox?: RotatedBoxMeta | null;
+  };
 }
 
 export interface AnnotationGroup {
@@ -31,6 +41,8 @@ export interface LabelmeShape {
   points: Point[];
   shape_type: string;
   flags: Record<string, unknown>;
+  angle?: number;
+  description?: string;
 }
 
 export interface LabelmeAnnotation {

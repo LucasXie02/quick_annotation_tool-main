@@ -1,4 +1,4 @@
-import type { AnnotationShape, Point } from '../types/annotations';
+import type { AnnotationShape, Point, RotatedBoxMeta } from '../types/annotations';
 
 export const normalizeRectPoints = (start: Point, end: Point): [Point, Point] => {
   const [x1, y1] = start;
@@ -74,6 +74,111 @@ export const getGroupBoundingBox = (shapes: AnnotationShape[]) => {
 };
 
 export const clonePoints = (points: Point[]): Point[] => points.map(([x, y]) => [x, y]);
+
+export const polygonArea = (points: Point[]): number => {
+  let area = 0;
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+    area += (points[j][0] + points[i][0]) * (points[j][1] - points[i][1]);
+  }
+  return area / 2;
+};
+
+export const rotatedBoxToPolygon = (meta: RotatedBoxMeta): Point[] => {
+  const { center, width, height, angle } = meta;
+  const rad = (angle * Math.PI) / 180;
+  const halfW = width / 2;
+  const halfH = height / 2;
+  const corners: Point[] = [
+    [-halfW, -halfH],
+    [halfW, -halfH],
+    [halfW, halfH],
+    [-halfW, halfH]
+  ];
+  return corners.map(([x, y]) => {
+    const rotatedX = x * Math.cos(rad) + y * Math.sin(rad);
+    const rotatedY = -x * Math.sin(rad) + y * Math.cos(rad);
+    return [rotatedX + center[0], rotatedY + center[1]];
+  });
+};
+
+export const polygonToRotatedBox = (points: Point[]): RotatedBoxMeta | null => {
+  if (points.length !== 4) return null;
+  const [p1, p2, p3, p4] = points;
+  const center: Point = [
+    (p1[0] + p2[0] + p3[0] + p4[0]) / 4,
+    (p1[1] + p2[1] + p3[1] + p4[1]) / 4
+  ];
+  const vec1 = [p2[0] - p1[0], p2[1] - p1[1]];
+  const vec2 = [p4[0] - p1[0], p4[1] - p1[1]];
+  const width = Math.hypot(vec1[0], vec1[1]);
+  const height = Math.hypot(vec2[0], vec2[1]);
+  if (!width || !height) return null;
+  const angleRad = Math.atan2(vec1[1], vec1[0]);
+  const angleDeg = (angleRad * 180) / Math.PI;
+  return {
+    center,
+    width,
+    height,
+    angle: angleDeg
+  };
+};
+
+export const rotatedBoxFromAxisPoints = (points: Point[], angle: number): RotatedBoxMeta => {
+  const [[x1, y1], [x2, y2]] = points;
+  const center: Point = [(x1 + x2) / 2, (y1 + y2) / 2];
+  const width = Math.abs(x2 - x1);
+  const height = Math.abs(y2 - y1);
+  return { center, width, height, angle };
+};
+
+export const rotatedBoxToAxisPoints = (meta: RotatedBoxMeta): [Point, Point] => {
+  const halfW = meta.width / 2;
+  const halfH = meta.height / 2;
+  return [
+    [meta.center[0] - halfW, meta.center[1] - halfH],
+    [meta.center[0] + halfW, meta.center[1] + halfH]
+  ];
+};
+
+export const worldToLocal = (point: Point, meta: RotatedBoxMeta): Point => {
+  const dx = point[0] - meta.center[0];
+  const dy = point[1] - meta.center[1];
+  const rad = (meta.angle * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  return [dx * cos - dy * sin, dx * sin + dy * cos];
+};
+
+export const pointInPolygon = (point: Point, polygon: Point[]): boolean => {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i][0];
+    const yi = polygon[i][1];
+    const xj = polygon[j][0];
+    const yj = polygon[j][1];
+    const intersect =
+      yi > point[1] !== yj > point[1] &&
+      point[0] < ((xj - xi) * (point[1] - yi)) / (yj - yi + 0.000001) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+};
+
+export const shapeToPolygon = (shape: AnnotationShape): Point[] => {
+  if (shape.metadata?.rotatedBox) {
+    return rotatedBoxToPolygon(shape.metadata.rotatedBox);
+  }
+  if (shape.shapeType === 'rectangle') {
+    const [topLeft, bottomRight] = normalizeRectPoints(shape.points[0], shape.points[1]);
+    return rectToPolygon(topLeft, bottomRight);
+  }
+  return shape.points;
+};
+
+export const shapeContainsPoint = (shape: AnnotationShape, point: Point): boolean => {
+  const polygon = shapeToPolygon(shape);
+  return pointInPolygon(point, polygon);
+};
 
 export const getShapeBoundingBox = (shape: AnnotationShape) => {
   const points = shapeToPolygonPoints(shape);

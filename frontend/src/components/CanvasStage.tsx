@@ -4,28 +4,52 @@ import type Konva from 'konva';
 import type { KonvaEventObject } from 'konva/lib/Node';
 import useImage from '../hooks/useImage';
 
-import type { AnnotationShape, ImageMeta, Point, ToolType, ShapeType } from '../types/annotations';
+import type {
+  AnnotationShape,
+  ImageMeta,
+  Point,
+  ToolType,
+  ShapeType,
+  RotatedBoxMeta
+} from '../types/annotations';
 import {
   normalizeRectPoints,
   rectToPolygon,
   translatePoints,
   getGroupBoundingBox,
   clonePoints,
-  rotatePolygon
+  rotatePolygon,
+  rotatedBoxToPolygon,
+  rotatePoint,
+  shapeContainsPoint,
+  shapeToPolygon,
+  polygonArea,
+  worldToLocal
 } from '../utils/geometry';
+
+const HANDLE_OFFSET = 10;
+const MIN_ROTATED_BOX_SIZE = 4;
 
 interface CanvasStageProps {
   image: ImageMeta | null;
   shapes: AnnotationShape[];
   tool: ToolType;
-  onCreateShape: (shape: { shapeType: ShapeType; points: Point[] }) => void;
-  onUpdateShapePoints: (shapeId: string, points: Point[]) => void;
-  onBatchUpdateShapePoints: (updates: Array<{ shapeId: string; points: Point[] }>) => void;
+  onCreateShape: (shape: {
+    shapeType: ShapeType;
+    points: Point[];
+    metadata?: AnnotationShape['metadata'];
+  }) => void;
+  onUpdateShapePoints: (shapeId: string, points: Point[], metadata?: AnnotationShape['metadata']) => void;
+  onBatchUpdateShapePoints: (
+    updates: Array<{ shapeId: string; points: Point[]; metadata?: AnnotationShape['metadata'] }>
+  ) => void;
   selectedShapeId: string | null;
   selectedGroupId: number | null;
   onSelectShape(id: string | null, groupId?: number): void;
   onAreaSelect(topLeft: Point, bottomRight: Point): void;
   viewResetTrigger: number;
+  onGroupTransformComplete?: (groupId: number, mode: 'translate' | 'rotate') => void;
+  selectionLocked: boolean;
 }
 
 interface DraftRect {
@@ -45,16 +69,24 @@ export function CanvasStage({
   selectedGroupId,
   onSelectShape,
   onAreaSelect,
-  viewResetTrigger
+  viewResetTrigger,
+  onGroupTransformComplete,
+  selectionLocked
 }: CanvasStageProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<Konva.Stage | null>(null);
   const transformerRef = useRef<Konva.Transformer | null>(null);
   const shapeRefs = useRef<Record<string, Konva.Node | null>>({});
+  const selectionCycleRef = useRef<{
+    stack: string[];
+    pointer: Point;
+    index: number;
+  } | null>(null);
 
   const [containerSize, setContainerSize] = useState({ width: 800, height: 600 });
   const [stageScale, setStageScale] = useState(1);
   const [stagePosition, setStagePosition] = useState({ x: 0, y: 0 });
+  const [stageDragLocked, setStageDragLocked] = useState(false);
   const [draftRect, setDraftRect] = useState<DraftRect | null>(null);
   const [polygonDraft, setPolygonDraft] = useState<Point[]>([]);
   const [cursorPoint, setCursorPoint] = useState<Point | null>(null);
@@ -63,18 +95,22 @@ export function CanvasStage({
         mode: 'translate';
         groupId: number;
         startPointer: Point;
-        initialShapes: Record<string, { points: Point[]; shapeType: ShapeType }>;
+        initialShapes: Record<string, { points: Point[]; shapeType: ShapeType; metadata?: AnnotationShape['metadata'] }>;
       }
     | {
         mode: 'rotate';
         groupId: number;
         center: Point;
         startAngle: number;
-        initialShapes: Record<string, { points: Point[]; shapeType: ShapeType }>;
+        initialShapes: Record<string, { points: Point[]; shapeType: ShapeType; metadata?: AnnotationShape['metadata'] }>;
       }
     | null
   >(null);
-
+  const handleResizeRef = useRef<{
+    shapeId: string;
+    direction: 'left' | 'right' | 'top' | 'bottom';
+    baseMeta: RotatedBoxMeta;
+  } | null>(null);
   const [imageElement] = useImage(image?.src ?? '');
 
   useEffect(() => {
@@ -190,8 +226,15 @@ const groupBounds = useMemo(() => {
       return;
     }
     if (rect.tool === 'rotated') {
-      const polygonPoints = rectToPolygon(topLeft, bottomRight);
-      onCreateShape({ shapeType: 'polygon', points: polygonPoints });
+      const center: Point = [
+        (topLeft[0] + bottomRight[0]) / 2,
+        (topLeft[1] + bottomRight[1]) / 2
+      ];
+      const width = bottomRight[0] - topLeft[0];
+      const height = bottomRight[1] - topLeft[1];
+      const metadata = { rotatedBox: { center, width, height, angle: 0 } };
+      const polygonPoints = rotatedBoxToPolygon(metadata.rotatedBox);
+      onCreateShape({ shapeType: 'polygon', points: polygonPoints, metadata });
     } else {
       onCreateShape({ shapeType: 'rectangle', points: [topLeft, bottomRight] });
     }
@@ -201,14 +244,8 @@ const groupBounds = useMemo(() => {
     if (groupTransformRef.current) {
       return;
     }
-    // prevent deselect when clicking transformer handles
-    if (event.target === event.target.getStage()) {
-      onSelectShape(null);
-      if (tool === 'select') {
-        return;
-      }
-    }
-    if (tool === 'select') {
+    // prevent deselect when grabbing stage for panning
+    if (event.target === event.target.getStage() && tool === 'select') {
       return;
     }
     const point = getStagePoint();
@@ -231,7 +268,8 @@ const groupBounds = useMemo(() => {
         const dy = pointer[1] - snapshot.startPointer[1];
         const updates = Object.entries(snapshot.initialShapes).map(([shapeId, data]) => ({
           shapeId,
-          points: translatePoints(data.points, dx, dy)
+          points: translatePoints(data.points, dx, dy),
+          metadata: translateMetadata(data.metadata, dx, dy)
         }));
         onBatchUpdateShapePoints(updates);
       } else if (snapshot.mode === 'rotate') {
@@ -251,10 +289,23 @@ const groupBounds = useMemo(() => {
           return {
             shapeId,
             points: rotated,
-            shapeType: shapeTypeOverride
+            shapeType: shapeTypeOverride,
+            metadata: rotateMetadata(data.metadata, snapshot.center, delta)
           };
         });
         onBatchUpdateShapePoints(updates);
+      }
+      return;
+    }
+
+    if (handleResizeRef.current) {
+      const pointer = getStagePoint();
+      if (!pointer) return;
+      const { shapeId, direction, baseMeta } = handleResizeRef.current;
+      if (direction === 'left' || direction === 'right') {
+        handleWidthHandleDrag(shapeId, baseMeta, pointer, direction);
+      } else {
+        handleHeightHandleDrag(shapeId, baseMeta, pointer, direction);
       }
       return;
     }
@@ -274,8 +325,21 @@ const groupBounds = useMemo(() => {
   };
 
   const handleStageMouseUp = () => {
+    if (handleResizeRef.current) {
+      handleResizeRef.current = null;
+      unlockStageDrag();
+      return;
+    }
+
     if (groupTransformRef.current) {
+      const snapshot = groupTransformRef.current;
       groupTransformRef.current = null;
+      if (snapshot.mode === 'translate') {
+        onGroupTransformComplete?.(snapshot.groupId, 'translate');
+      } else {
+        onGroupTransformComplete?.(snapshot.groupId, 'rotate');
+      }
+      unlockStageDrag();
       return;
     }
     if (draftRect) {
@@ -293,6 +357,45 @@ const groupBounds = useMemo(() => {
     }
     setPolygonDraft([]);
     setCursorPoint(null);
+  };
+
+  const selectShapeAtPointer = (shape: AnnotationShape, pointer: Point | null) => {
+    if (selectionLocked && selectedShapeId && shape.id !== selectedShapeId) {
+      return;
+    }
+    if (selectedShapeId === shape.id) {
+      return;
+    }
+    if (!pointer) {
+      selectionCycleRef.current = null;
+      onSelectShape(shape.id, shape.groupId);
+      return;
+    }
+    const overlapping = shapes
+      .filter((candidate) => shapeContainsPoint(candidate, pointer))
+      .sort((a, b) => Math.abs(polygonArea(shapeToPolygon(a))) - Math.abs(polygonArea(shapeToPolygon(b))));
+    if (overlapping.length <= 1) {
+      selectionCycleRef.current = { stack: [shape.id], pointer, index: 0 };
+      onSelectShape(shape.id, shape.groupId);
+      return;
+    }
+    const stackIds = overlapping.map((candidate) => candidate.id);
+    const previous = selectionCycleRef.current;
+    const currentIndex = overlapping.findIndex((candidate) => candidate.id === shape.id);
+    let nextIndex = 0;
+    if (
+      previous &&
+      stackIds.length === previous.stack.length &&
+      stackIds.every((id, idx) => id === previous.stack[idx]) &&
+      Math.hypot(previous.pointer[0] - pointer[0], previous.pointer[1] - pointer[1]) < 3
+    ) {
+      nextIndex = (previous.index + 1) % stackIds.length;
+    } else if (stackIds.length === 1 && currentIndex >= 0) {
+      nextIndex = currentIndex;
+    }
+    const target = overlapping[nextIndex];
+    selectionCycleRef.current = { stack: stackIds, pointer, index: nextIndex };
+    onSelectShape(target.id, target.groupId);
   };
 
   const finalizeRectPreview = draftRect
@@ -331,14 +434,16 @@ const groupBounds = useMemo(() => {
     const dx = x - oldX;
     const dy = y - oldY;
     const translated = translatePoints(shape.points, dx, dy);
-    onUpdateShapePoints(shape.id, translated);
+    const metadata = translateMetadata(shape.metadata, dx, dy);
+    onUpdateShapePoints(shape.id, translated, metadata);
   };
 
   const handlePolygonDrag = (shape: AnnotationShape, node: Konva.Group) => {
     const x = node.x();
     const y = node.y();
     const translated = translatePoints(shape.points, x, y);
-    onUpdateShapePoints(shape.id, translated);
+    const metadata = translateMetadata(shape.metadata, x, y);
+    onUpdateShapePoints(shape.id, translated, metadata);
     node.x(0);
     node.y(0);
   };
@@ -349,7 +454,7 @@ const groupBounds = useMemo(() => {
       const { x, y } = transform.point({ x: point[0], y: point[1] });
       return [x, y] as Point;
     });
-    onUpdateShapePoints(shape.id, nextPoints);
+    onUpdateShapePoints(shape.id, nextPoints, shape.metadata?.rotatedBox ? { rotatedBox: null } : shape.metadata);
     node.rotation(0);
     node.scaleX(1);
     node.scaleY(1);
@@ -358,18 +463,127 @@ const groupBounds = useMemo(() => {
 
   const handleVertexDrag = (shape: AnnotationShape, vertexIndex: number, newPoint: Point) => {
     const nextPoints = shape.points.map((pt, idx) => (idx === vertexIndex ? newPoint : pt)) as Point[];
-    onUpdateShapePoints(shape.id, nextPoints);
+    onUpdateShapePoints(shape.id, nextPoints, shape.metadata?.rotatedBox ? { rotatedBox: null } : shape.metadata);
   };
 
-  const snapshotGroupShapes = (): Record<string, { points: Point[]; shapeType: ShapeType }> => {
-    const snapshot: Record<string, { points: Point[]; shapeType: ShapeType }> = {};
+  const snapshotGroupShapes = () => {
+    const snapshot: Record<
+      string,
+      { points: Point[]; shapeType: ShapeType; metadata?: AnnotationShape['metadata'] }
+    > = {};
     selectedGroupShapes.forEach((shape) => {
       snapshot[shape.id] = {
         points: clonePoints(shape.points),
-        shapeType: shape.shapeType
+        shapeType: shape.shapeType,
+        metadata: shape.metadata
       };
     });
     return snapshot;
+  };
+
+  const translateMetadata = (
+    metadata: AnnotationShape['metadata'],
+    dx: number,
+    dy: number
+  ): AnnotationShape['metadata'] => {
+    if (!metadata?.rotatedBox) return metadata;
+    return {
+      rotatedBox: {
+        ...metadata.rotatedBox,
+        center: [
+          metadata.rotatedBox.center[0] + dx,
+          metadata.rotatedBox.center[1] + dy
+        ] as Point
+      }
+    };
+  };
+
+  const rotateMetadata = (
+    metadata: AnnotationShape['metadata'],
+    pivot: Point,
+    deltaRad: number
+  ): AnnotationShape['metadata'] => {
+    if (!metadata?.rotatedBox) return metadata;
+    const center = rotatePoint(metadata.rotatedBox.center, pivot, deltaRad);
+    const deltaDeg = (deltaRad * 180) / Math.PI;
+    return {
+      rotatedBox: {
+        ...metadata.rotatedBox,
+        center,
+        angle: metadata.rotatedBox.angle + deltaDeg
+      }
+    };
+  };
+
+  const updateRotatedBoxShape = (shapeId: string, meta: RotatedBoxMeta) => {
+    const polygonPoints = rotatedBoxToPolygon(meta);
+    onUpdateShapePoints(shapeId, polygonPoints, { rotatedBox: meta });
+  };
+
+  const lockStageDrag = () => setStageDragLocked(true);
+  const unlockStageDrag = () => setStageDragLocked(false);
+  const beginHandleResize = (
+    shape: AnnotationShape,
+    direction: 'left' | 'right' | 'top' | 'bottom'
+  ) => {
+    const meta = shape.metadata?.rotatedBox;
+    if (!meta) return;
+    handleResizeRef.current = {
+      shapeId: shape.id,
+      direction,
+      baseMeta: {
+        ...meta,
+        center: [meta.center[0], meta.center[1]] as Point
+      }
+    };
+    lockStageDrag();
+  };
+
+  const localOffsetToWorld = (meta: RotatedBoxMeta, offsetX: number, offsetY: number): Point => {
+    const rad = (meta.angle * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    return [offsetX * cos - offsetY * sin, offsetX * sin + offsetY * cos];
+  };
+
+  const handleWidthHandleDrag = (
+    shapeId: string,
+    baseMeta: RotatedBoxMeta,
+    pointer: Point,
+    direction: 'left' | 'right'
+  ) => {
+    const [localX] = worldToLocal(pointer, baseMeta);
+    const sign = direction === 'right' ? 1 : -1;
+    const movingFace = localX - sign * HANDLE_OFFSET;
+    const anchorFace = direction === 'right' ? -baseMeta.width / 2 : baseMeta.width / 2;
+    const minimumFace = anchorFace + sign * MIN_ROTATED_BOX_SIZE;
+    const constrainedFace = sign === 1 ? Math.max(movingFace, minimumFace) : Math.min(movingFace, minimumFace);
+    const width = Math.max(MIN_ROTATED_BOX_SIZE, Math.abs(constrainedFace - anchorFace));
+    const centerLocalX = (constrainedFace + anchorFace) / 2;
+    const [offsetX, offsetY] = localOffsetToWorld(baseMeta, centerLocalX, 0);
+    const center: Point = [baseMeta.center[0] + offsetX, baseMeta.center[1] + offsetY];
+    const nextMeta = { ...baseMeta, width, center };
+    updateRotatedBoxShape(shapeId, nextMeta);
+  };
+
+  const handleHeightHandleDrag = (
+    shapeId: string,
+    baseMeta: RotatedBoxMeta,
+    pointer: Point,
+    direction: 'top' | 'bottom'
+  ) => {
+    const [, localY] = worldToLocal(pointer, baseMeta);
+    const sign = direction === 'bottom' ? 1 : -1;
+    const movingFace = localY - sign * HANDLE_OFFSET;
+    const anchorFace = direction === 'bottom' ? -baseMeta.height / 2 : baseMeta.height / 2;
+    const minimumFace = anchorFace + sign * MIN_ROTATED_BOX_SIZE;
+    const constrainedFace = sign === 1 ? Math.max(movingFace, minimumFace) : Math.min(movingFace, minimumFace);
+    const height = Math.max(MIN_ROTATED_BOX_SIZE, Math.abs(constrainedFace - anchorFace));
+    const centerLocalY = (constrainedFace + anchorFace) / 2;
+    const [offsetX, offsetY] = localOffsetToWorld(baseMeta, 0, centerLocalY);
+    const center: Point = [baseMeta.center[0] + offsetX, baseMeta.center[1] + offsetY];
+    const nextMeta = { ...baseMeta, height, center };
+    updateRotatedBoxShape(shapeId, nextMeta);
   };
 
   const startGroupTranslate = () => {
@@ -408,10 +622,22 @@ const groupBounds = useMemo(() => {
         scaleY={stageScale}
         x={stagePosition.x}
         y={stagePosition.y}
-        draggable={tool === 'select' && !isDrawing}
+        draggable={tool === 'select' && !isDrawing && !stageDragLocked && !selectionLocked}
         onWheel={handleWheel}
         onDragEnd={handleStageDragEnd}
         onMouseDown={handleStageMouseDown}
+        onClick={(event) => {
+          if (!selectionLocked && tool === 'select' && event.target === event.target.getStage()) {
+            selectionCycleRef.current = null;
+            onSelectShape(null);
+          }
+        }}
+        onTap={(event) => {
+          if (!selectionLocked && tool === 'select' && event.target === event.target.getStage()) {
+            selectionCycleRef.current = null;
+            onSelectShape(null);
+          }
+        }}
         onMouseMove={handleStageMouseMove}
         onMouseUp={handleStageMouseUp}
         onDblClick={handlePolygonDoubleClick}
@@ -461,11 +687,17 @@ const groupBounds = useMemo(() => {
                   }
                   onClick={(event) => {
                     event.cancelBubble = true;
-                    onSelectShape(shape.id, shape.groupId);
+                    selectShapeAtPointer(shape, getStagePoint());
                   }}
+                  onMouseDown={() => lockStageDrag()}
+                  onMouseUp={() => unlockStageDrag()}
                   draggable={tool === 'select'}
                   onDragEnd={(event) => handleRectDrag(shape, event.target as Konva.Rect)}
-                  onTransformEnd={(event) => handleRectTransform(shape, event.target as Konva.Rect)}
+                  onTransformStart={lockStageDrag}
+                  onTransformEnd={(event) => {
+                    handleRectTransform(shape, event.target as Konva.Rect);
+                    unlockStageDrag();
+                  }}
                   perfectDrawEnabled={false}
                 />
               );
@@ -478,7 +710,11 @@ const groupBounds = useMemo(() => {
                   shapeRefs.current[shape.id] = node;
                 }}
                 draggable={tool === 'select'}
-                onDragEnd={(event) => handlePolygonDrag(shape, event.target as Konva.Group)}
+                onDragStart={lockStageDrag}
+                onDragEnd={(event) => {
+                  handlePolygonDrag(shape, event.target as Konva.Group);
+                  unlockStageDrag();
+                }}
                 onTransformEnd={(event) => handlePolygonTransform(shape, event.target as Konva.Group)}
               >
                 <Line
@@ -495,10 +731,12 @@ const groupBounds = useMemo(() => {
                   }
                   onClick={(event) => {
                     event.cancelBubble = true;
-                    onSelectShape(shape.id, shape.groupId);
+                    selectShapeAtPointer(shape, getStagePoint());
                   }}
+                  onMouseDown={() => lockStageDrag()}
+                  onMouseUp={() => unlockStageDrag()}
                 />
-                {selectedShapeId === shape.id &&
+                {selectedShapeId === shape.id && !shape.metadata?.rotatedBox &&
                   shape.points.map((point, idx) => (
                     <Circle
                       key={`${shape.id}-vertex-${idx}`}
@@ -509,15 +747,55 @@ const groupBounds = useMemo(() => {
                       stroke="#eff6ff"
                       strokeWidth={1}
                       draggable={tool === 'select'}
+                      onDragStart={lockStageDrag}
+                      onDragEnd={() => unlockStageDrag()}
                       onDragMove={(event) => {
                         handleVertexDrag(shape, idx, [event.target.x(), event.target.y()]);
                       }}
                       onClick={(event) => {
                         event.cancelBubble = true;
-                        onSelectShape(shape.id, shape.groupId);
+                        selectShapeAtPointer(shape, getStagePoint());
                       }}
                     />
                   ))}
+                {selectedShapeId === shape.id && shape.metadata?.rotatedBox && (() => {
+                  const meta = shape.metadata.rotatedBox;
+                  const rad = (meta.angle * Math.PI) / 180;
+                  const handlePosition = (offsetX: number, offsetY: number) =>
+                    rotatePoint([meta.center[0] + offsetX, meta.center[1] + offsetY], meta.center, rad);
+                  const positions = {
+                    right: handlePosition(meta.width / 2 + HANDLE_OFFSET, 0),
+                    left: handlePosition(-meta.width / 2 - HANDLE_OFFSET, 0),
+                    top: handlePosition(0, -meta.height / 2 - HANDLE_OFFSET),
+                    bottom: handlePosition(0, meta.height / 2 + HANDLE_OFFSET)
+                  } as const;
+
+                  const renderHandle = (key: keyof typeof positions) => (
+                    <Circle
+                      key={`${shape.id}-handle-${key}`}
+                      x={positions[key][0]}
+                      y={positions[key][1]}
+                      radius={9}
+                      fill="#34d399"
+                      stroke="#065f46"
+                      strokeWidth={2}
+                      hitStrokeWidth={20}
+                      onMouseDown={(event) => {
+                        event.cancelBubble = true;
+                        beginHandleResize(shape, key);
+                      }}
+                    />
+                  );
+
+                  return (
+                    <>
+                      {renderHandle('right')}
+                      {renderHandle('left')}
+                      {renderHandle('top')}
+                      {renderHandle('bottom')}
+                    </>
+                  );
+                })()}
               </Group>
             );
           })}

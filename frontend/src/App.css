@@ -425,6 +425,48 @@ body {
   cursor: pointer;
 }
 
+.instructions-panel {
+  border: 1px solid #e2e8f0;
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  background: #f8fafc;
+}
+
+.instructions-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.instructions-panel ol {
+  margin: 0;
+  padding-left: 1.25rem;
+  color: #0f172a;
+  font-size: 0.9rem;
+}
+
+.size-controls {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.size-controls label {
+  flex: 1;
+  font-size: 0.85rem;
+  color: #0f172a;
+  display: flex;
+  flex-direction: column;
+}
+
+.size-controls input {
+  margin-top: 0.25rem;
+  padding: 0.25rem 0.4rem;
+  border: 1px solid #cbd5f5;
+  border-radius: 0.4rem;
+}
+
 @media (max-width: 960px) {
   .app-main {
     grid-template-columns: 1fr;
