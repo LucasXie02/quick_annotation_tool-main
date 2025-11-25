@@ -24,7 +24,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+# Health check endpoint.
 @app.get("/api/health", response_model=Dict[str, Any])
 async def health_check() -> Dict[str, Any]:
     """Basic health probe so containers/orchestrators can verify readiness."""
